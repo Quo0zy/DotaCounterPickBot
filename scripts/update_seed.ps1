@@ -1,142 +1,143 @@
 param(
-    [string]$OutputPath = "data\seed_matchups.json",
-    [int]$MinGames = 20
+    [string]$OutputPath = "data\seed_immortal.json",
+    [ValidateRange(1, 30)]
+    [int]$Days = 7,
+    [string]$ApiToken = $env:STRATZ_API_TOKEN
 )
 
 $ErrorActionPreference = "Stop"
 
-function Get-OpenDotaJson {
-    param(
-        [string]$Url,
-        [string]$CachePath
-    )
+if ([string]::IsNullOrWhiteSpace($ApiToken)) {
+    throw "Set STRATZ_API_TOKEN or pass -ApiToken. A free token is available at https://stratz.com/api."
+}
 
-    if ($CachePath -and (Test-Path $CachePath)) {
-        $cachedJson = Get-Content -Path $CachePath -Raw -Encoding UTF8
-        return ($cachedJson | ConvertFrom-Json)
+$query = @'
+query HeroWinDayStats(
+  $days: Int,
+  $ranks: [RankBracket!],
+  $positions: [MatchPlayerPositionType!],
+  $regions: [BasicRegionType!],
+  $gameModes: [GameModeEnumType!]
+) {
+  heroStats {
+    winDay(
+      take: $days
+      bracketIds: $ranks
+      positionIds: $positions
+      regionIds: $regions
+      gameModeIds: $gameModes
+    ) {
+      day
+      heroId
+      winCount
+      matchCount
     }
+  }
+}
+'@
 
-    for ($attempt = 1; $attempt -le 5; $attempt += 1) {
-        $json = curl.exe -s -L --max-time 45 $Url
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($json)) {
-            Start-Sleep -Seconds 5
-            continue
-        }
+$variables = [ordered]@{
+    days = $Days
+    ranks = @("IMMORTAL")
+    positions = @()
+    regions = @()
+    gameModes = @("ALL_PICK_RANKED")
+}
 
-        if ($json -like '*minute rate limit exceeded*') {
-            Write-Host "Rate limit reached, waiting before retry..."
-            Start-Sleep -Seconds 70
-            continue
-        }
+$requestBody = [ordered]@{
+    query = $query
+    variables = $variables
+} | ConvertTo-Json -Depth 8
 
-        $parsed = $json | ConvertFrom-Json
-        if ($CachePath) {
-            Set-Content -Path $CachePath -Value $json -Encoding UTF8
-        }
-        return $parsed
-    }
+Write-Host "Downloading $Days days of Immortal ranked All Pick stats from STRATZ..."
+$response = Invoke-RestMethod `
+    -Uri "https://api.stratz.com/graphql" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Headers @{
+        Authorization = "Bearer $ApiToken"
+        "User-Agent" = "DotaCounterPeak/1.0"
+    } `
+    -Body $requestBody `
+    -TimeoutSec 90
 
-    throw "Failed to download $Url"
+if ($response.errors) {
+    $messages = @($response.errors | ForEach-Object { $_.message }) -join "; "
+    throw "STRATZ GraphQL error: $messages"
+}
+
+$dailyRows = @($response.data.heroStats.winDay)
+if ($dailyRows.Count -eq 0) {
+    throw "STRATZ returned no Immortal statistics. The existing seed was not changed."
+}
+
+$heroRows = @(Invoke-RestMethod -Uri "https://api.opendota.com/api/heroes" -TimeoutSec 60)
+$heroNames = @{}
+foreach ($hero in $heroRows) {
+    $heroNames[[string]$hero.id] = [string]$hero.localized_name
+}
+
+$totalHeroPicks = [double](
+    $dailyRows |
+        Measure-Object -Property matchCount -Sum
+).Sum
+$estimatedMatches = $totalHeroPicks / 10.0
+if ($estimatedMatches -le 0) {
+    throw "STRATZ returned an invalid match count. The existing seed was not changed."
+}
+
+$seedHeroes = @(
+    $dailyRows |
+        Group-Object -Property heroId |
+        ForEach-Object {
+            $heroId = [string]$_.Name
+            $matches = [double](
+                $_.Group |
+                    Measure-Object -Property matchCount -Sum
+            ).Sum
+            $wins = [double](
+                $_.Group |
+                    Measure-Object -Property winCount -Sum
+            ).Sum
+
+            if ($matches -gt 0 -and $heroNames.ContainsKey($heroId)) {
+                [ordered]@{
+                    name = $heroNames[$heroId]
+                    win_rate = [Math]::Round(100.0 * $wins / $matches, 2)
+                    pick_rate = [Math]::Round(100.0 * $matches / $estimatedMatches, 2)
+                }
+            }
+        } |
+        Where-Object { $null -ne $_ } |
+        Sort-Object `
+            @{ Expression = { [double]$_.win_rate }; Descending = $true },
+            @{ Expression = { [double]$_.pick_rate }; Descending = $true }
+)
+
+if ($seedHeroes.Count -lt 120) {
+    throw "STRATZ returned only $($seedHeroes.Count) heroes. The existing seed was not changed."
+}
+
+$payload = [ordered]@{
+    generated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    source = "STRATZ GraphQL API"
+    source_url = "https://api.stratz.com/graphql"
+    rank = "IMMORTAL"
+    game_mode = "ALL_PICK_RANKED"
+    period_days = $Days
+    hero_count = $seedHeroes.Count
+    heroes = $seedHeroes
 }
 
 $root = Split-Path -Parent $PSScriptRoot
 $absoluteOutputPath = Join-Path $root $OutputPath
 $outputDirectory = Split-Path -Parent $absoluteOutputPath
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
-$cacheDirectory = Join-Path $outputDirectory "opendota_raw"
-New-Item -ItemType Directory -Force -Path $cacheDirectory | Out-Null
 
-$heroesUrl = "http://api.opendota.com/api/heroes"
-$heroesCachePath = Join-Path $cacheDirectory "heroes.json"
-$heroRows = @(Get-OpenDotaJson $heroesUrl $heroesCachePath | ForEach-Object { $_ })
-$heroNames = @{}
-
-foreach ($hero in $heroRows) {
-    $heroNames[[string]$hero.id] = [string]$hero.localized_name
-}
-
-$seedHeroes = New-Object System.Collections.Generic.List[object]
-$skippedHeroes = New-Object System.Collections.Generic.List[string]
-$processed = 0
-
-foreach ($hero in $heroRows) {
-    $processed += 1
-    Write-Host "[$processed/$($heroRows.Count)] $($hero.localized_name)"
-
-    $matchupsUrl = "http://api.opendota.com/api/heroes/$($hero.id)/matchups"
-    $matchupsCachePath = Join-Path $cacheDirectory "hero_$($hero.id)_matchups.json"
-    $matchupRows = @(Get-OpenDotaJson $matchupsUrl $matchupsCachePath | ForEach-Object { $_ })
-    $knownMatchups = @(
-        $matchupRows |
-            Where-Object {
-                $heroNames.ContainsKey([string]$_.hero_id) -and
-                [int]$_.games_played -ge $MinGames
-            }
-    )
-
-    if ($knownMatchups.Count -lt 6) {
-        $knownMatchups = @(
-            $matchupRows |
-                Where-Object { $heroNames.ContainsKey([string]$_.hero_id) }
-        )
-    }
-
-    if ($knownMatchups.Count -lt 3) {
-        $skippedHeroes.Add([string]$hero.localized_name)
-        continue
-    }
-
-    $byBestWinrate = @(
-        $knownMatchups |
-            Sort-Object `
-                @{ Expression = { [double]$_.wins / [double]$_.games_played }; Descending = $true },
-                @{ Expression = { [int]$_.games_played }; Descending = $true }
-    )
-    $byWorstWinrate = @(
-        $knownMatchups |
-            Sort-Object `
-                @{ Expression = { [double]$_.wins / [double]$_.games_played }; Descending = $false },
-                @{ Expression = { [int]$_.games_played }; Descending = $true }
-    )
-
-    $goodAgainst = @(
-        $byBestWinrate |
-            Select-Object -First 3 |
-            ForEach-Object { $heroNames[[string]$_.hero_id] }
-    )
-    $badAgainst = @(
-        $byWorstWinrate |
-            Select-Object -First 3 |
-            ForEach-Object { $heroNames[[string]$_.hero_id] }
-    )
-
-    $seedHeroes.Add([ordered]@{
-        name = [string]$hero.localized_name
-        good_against = $goodAgainst
-        bad_against = $badAgainst
-    })
-
-    Start-Sleep -Milliseconds 1100
-}
-
-$payload = [ordered]@{
-    generated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    source = "OpenDota API"
-    source_urls = @(
-        "http://api.opendota.com/api/heroes",
-        "http://api.opendota.com/api/heroes/{hero_id}/matchups"
-    )
-    min_games = $MinGames
-    hero_count = $seedHeroes.Count
-    skipped_heroes = $skippedHeroes
-    heroes = $seedHeroes
-}
-
+$temporaryPath = "$absoluteOutputPath.tmp"
 $payload |
     ConvertTo-Json -Depth 8 |
-    Set-Content -Path $absoluteOutputPath -Encoding UTF8
+    Set-Content -Path $temporaryPath -Encoding UTF8
+Move-Item -LiteralPath $temporaryPath -Destination $absoluteOutputPath -Force
 
-Write-Host "Saved $($seedHeroes.Count) heroes to $absoluteOutputPath"
-if ($skippedHeroes.Count -gt 0) {
-    Write-Host "Skipped: $($skippedHeroes -join ', ')"
-}
+Write-Host "Saved $($seedHeroes.Count) Immortal heroes to $absoluteOutputPath"

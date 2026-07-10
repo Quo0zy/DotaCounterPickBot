@@ -5,10 +5,12 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class HeroMatchups:
+class HeroStats:
     name: str
-    good_against: list[str]
-    bad_against: list[str]
+    win_rate: float
+    pick_rate: float
+    meta_rank: int
+    total_heroes: int
 
 
 def normalize_name(value: str) -> str:
@@ -16,7 +18,7 @@ def normalize_name(value: str) -> str:
     return "".join(char for char in value if char.isalnum())
 
 
-class MatchupRepository:
+class HeroStatsRepository:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
 
@@ -28,109 +30,145 @@ class MatchupRepository:
 
     def initialize(self) -> None:
         with self.connect() as connection:
-            connection.executescript(
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS heroes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
                     normalized_name TEXT NOT NULL UNIQUE,
+                    win_rate REAL,
+                    pick_rate REAL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-
-                CREATE TABLE IF NOT EXISTS matchups (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    hero_id INTEGER NOT NULL,
-                    opponent_name TEXT NOT NULL,
-                    normalized_opponent_name TEXT NOT NULL,
-                    relation TEXT NOT NULL CHECK (relation IN ('good', 'bad')),
-                    rank INTEGER NOT NULL CHECK (rank BETWEEN 1 AND 3),
-                    FOREIGN KEY (hero_id) REFERENCES heroes(id) ON DELETE CASCADE,
-                    UNIQUE (hero_id, relation, rank),
-                    UNIQUE (hero_id, relation, normalized_opponent_name)
-                );
+                )
                 """
             )
+            self._ensure_column(connection, "heroes", "win_rate", "REAL")
+            self._ensure_column(connection, "heroes", "pick_rate", "REAL")
 
-    def upsert_hero(self, name: str, good_against: list[str], bad_against: list[str]) -> None:
-        normalized_name = normalize_name(name)
-        if not normalized_name:
-            raise ValueError("Название героя не может быть пустым.")
-
-        self._validate_matchups(good_against, bad_against)
-
+    def upsert_hero(self, name: str, win_rate: float, pick_rate: float) -> None:
+        clean_name, normalized_name, win_rate, pick_rate = self._validate_hero(
+            name, win_rate, pick_rate
+        )
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO heroes (name, normalized_name)
-                VALUES (?, ?)
-                ON CONFLICT(normalized_name) DO UPDATE SET
-                    name = excluded.name,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (name.strip(), normalized_name),
+            self._upsert_hero(
+                connection,
+                clean_name,
+                normalized_name,
+                win_rate,
+                pick_rate,
             )
-            cursor = connection.execute(
-                "SELECT id FROM heroes WHERE normalized_name = ?",
-                (normalized_name,),
-            )
-            hero_id = int(cursor.fetchone()["id"])
 
-            connection.execute("DELETE FROM matchups WHERE hero_id = ?", (hero_id,))
-            self._insert_matchups(connection, hero_id, "good", good_against)
-            self._insert_matchups(connection, hero_id, "bad", bad_against)
-
-    def get_hero(self, name: str) -> HeroMatchups | None:
+    def get_hero(self, name: str) -> HeroStats | None:
         normalized_name = normalize_name(name)
         if not normalized_name:
             return None
 
         with self.connect() as connection:
-            hero = connection.execute(
-                "SELECT id, name FROM heroes WHERE normalized_name = ?",
+            row = connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        name,
+                        normalized_name,
+                        win_rate,
+                        pick_rate,
+                        RANK() OVER (ORDER BY win_rate DESC) AS meta_rank,
+                        COUNT(*) OVER () AS total_heroes
+                    FROM heroes
+                    WHERE win_rate IS NOT NULL AND pick_rate IS NOT NULL
+                )
+                SELECT name, win_rate, pick_rate, meta_rank, total_heroes
+                FROM ranked
+                WHERE normalized_name = ?
+                """,
                 (normalized_name,),
             ).fetchone()
-            if hero is None:
-                return None
 
-            rows = connection.execute(
-                """
-                SELECT opponent_name, relation
-                FROM matchups
-                WHERE hero_id = ?
-                ORDER BY relation, rank
-                """,
-                (hero["id"],),
-            ).fetchall()
-
-        good_against = [row["opponent_name"] for row in rows if row["relation"] == "good"]
-        bad_against = [row["opponent_name"] for row in rows if row["relation"] == "bad"]
-        return HeroMatchups(hero["name"], good_against, bad_against)
+        if row is None:
+            return None
+        return HeroStats(
+            name=str(row["name"]),
+            win_rate=float(row["win_rate"]),
+            pick_rate=float(row["pick_rate"]),
+            meta_rank=int(row["meta_rank"]),
+            total_heroes=int(row["total_heroes"]),
+        )
 
     def list_heroes(self) -> list[str]:
         with self.connect() as connection:
-            rows = connection.execute("SELECT name FROM heroes ORDER BY name COLLATE NOCASE").fetchall()
-        return [row["name"] for row in rows]
+            rows = connection.execute(
+                """
+                SELECT name
+                FROM heroes
+                WHERE win_rate IS NOT NULL AND pick_rate IS NOT NULL
+                ORDER BY name COLLATE NOCASE
+                """
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
 
     def seed_from_file(self, seed_path: Path) -> int:
         with seed_path.open("r", encoding="utf-8-sig") as file:
             payload = json.load(file)
 
-        heroes = payload.get("heroes", [])
-        seeded_count = 0
-        for hero in heroes:
-            self.upsert_hero(
-                str(hero["name"]),
-                [str(name) for name in hero["good_against"]],
-                [str(name) for name in hero["bad_against"]],
-            )
-            seeded_count += 1
+        if str(payload.get("rank", "")).upper() != "IMMORTAL":
+            raise ValueError("Seed-файл должен содержать статистику только ранга IMMORTAL.")
 
-        return seeded_count
+        heroes = payload.get("heroes")
+        if not isinstance(heroes, list) or not heroes:
+            raise ValueError("В seed-файле нет статистики героев.")
+
+        expected_count = payload.get("hero_count")
+        if expected_count is not None and int(expected_count) != len(heroes):
+            raise ValueError("hero_count не совпадает с числом героев в seed-файле.")
+
+        prepared: list[tuple[str, str, float, float]] = []
+        normalized_names: set[str] = set()
+        for hero in heroes:
+            clean_name, normalized_name, win_rate, pick_rate = self._validate_hero(
+                str(hero["name"]),
+                float(hero["win_rate"]),
+                float(hero["pick_rate"]),
+            )
+            if normalized_name in normalized_names:
+                raise ValueError(f"Герой {clean_name} повторяется в seed-файле.")
+            normalized_names.add(normalized_name)
+            prepared.append((clean_name, normalized_name, win_rate, pick_rate))
+
+        with self.connect() as connection:
+            for clean_name, normalized_name, win_rate, pick_rate in prepared:
+                self._upsert_hero(
+                    connection,
+                    clean_name,
+                    normalized_name,
+                    win_rate,
+                    pick_rate,
+                )
+
+            placeholders = ",".join("?" for _ in normalized_names)
+            connection.execute(
+                f"DELETE FROM heroes WHERE normalized_name NOT IN ({placeholders})",
+                tuple(normalized_names),
+            )
+
+            # Старые матчапы могли остаться после предыдущей версии базы.
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'matchups'"
+            ).fetchone()
+            if table_exists is not None:
+                connection.execute("DELETE FROM matchups")
+
+        return len(prepared)
 
     def hero_count(self) -> int:
         with self.connect() as connection:
-            row = connection.execute("SELECT COUNT(*) AS count FROM heroes").fetchone()
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM heroes
+                WHERE win_rate IS NOT NULL AND pick_rate IS NOT NULL
+                """
+            ).fetchone()
         return int(row["count"])
 
     def delete_hero(self, name: str) -> bool:
@@ -145,30 +183,60 @@ class MatchupRepository:
             )
             return cursor.rowcount > 0
 
-    def _insert_matchups(
+    def _upsert_hero(
         self,
         connection: sqlite3.Connection,
-        hero_id: int,
-        relation: str,
-        opponents: list[str],
+        name: str,
+        normalized_name: str,
+        win_rate: float,
+        pick_rate: float,
     ) -> None:
-        for rank, opponent_name in enumerate(opponents, 1):
-            connection.execute(
-                """
-                INSERT INTO matchups (hero_id, opponent_name, normalized_opponent_name, relation, rank)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (hero_id, opponent_name.strip(), normalize_name(opponent_name), relation, rank),
-            )
+        connection.execute(
+            """
+            INSERT INTO heroes (name, normalized_name, win_rate, pick_rate)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(normalized_name) DO UPDATE SET
+                name = excluded.name,
+                win_rate = excluded.win_rate,
+                pick_rate = excluded.pick_rate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (name, normalized_name, win_rate, pick_rate),
+        )
 
-    def _validate_matchups(self, good_against: list[str], bad_against: list[str]) -> None:
-        if len(good_against) != 3 or len(bad_against) != 3:
-            raise ValueError("Нужно указать ровно 3 хороших и ровно 3 плохих матчапа.")
+    def _validate_hero(
+        self,
+        name: str,
+        win_rate: float,
+        pick_rate: float,
+    ) -> tuple[str, str, float, float]:
+        clean_name = name.strip()
+        normalized_name = normalize_name(clean_name)
+        if not normalized_name:
+            raise ValueError("Название героя не может быть пустым.")
 
-        all_names = good_against + bad_against
-        normalized_names = [normalize_name(name) for name in all_names]
-        if any(not name for name in normalized_names):
-            raise ValueError("В списках матчапов есть пустое название героя.")
+        win_rate = float(win_rate)
+        pick_rate = float(pick_rate)
+        if not 0 <= win_rate <= 100:
+            raise ValueError("Винрейт должен быть от 0 до 100 процентов.")
+        if not 0 <= pick_rate <= 100:
+            raise ValueError("Пикрейт должен быть от 0 до 100 процентов.")
+        return clean_name, normalized_name, win_rate, pick_rate
 
-        if len(normalized_names) != len(set(normalized_names)):
-            raise ValueError("Один и тот же герой не должен повторяться в матчапах.")
+    def _ensure_column(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+# Старое имя оставлено как алиас, чтобы внешние импорты проекта не сломались.
+MatchupRepository = HeroStatsRepository
